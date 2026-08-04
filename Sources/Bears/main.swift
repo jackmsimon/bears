@@ -11,6 +11,7 @@ private struct Camera {
 
 @MainActor
 private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopoverDelegate {
+    private let largeViewDefaultsKey = "LargeView"
     private let cameras = [
         Camera(
             name: "Brooks Falls",
@@ -33,7 +34,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
     private var webView: WKWebView!
-    private var hotKey: EventHotKeyRef?
+    private var hotKeys: [EventHotKeyRef] = []
     private var hotKeyHandler: EventHandlerRef?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -44,7 +45,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        if let hotKey {
+        for hotKey in hotKeys {
             UnregisterEventHotKey(hotKey)
         }
         if let hotKeyHandler {
@@ -75,7 +76,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         viewController.view = webView
 
         popover = NSPopover()
-        popover.contentSize = NSSize(width: 640, height: 360)
+        popover.contentSize = popoverSize
         popover.contentViewController = viewController
         popover.behavior = .transient
         popover.delegate = self
@@ -104,8 +105,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 guard status == noErr, hotKeyID.signature == 0x42656172 else { return status }
 
                 let delegate = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
+                let id = hotKeyID.id
                 DispatchQueue.main.async {
-                    delegate.showNextCamera()
+                    if id == 1 {
+                        delegate.showCurrentCamera()
+                    } else if id == 2 {
+                        delegate.showNextCamera()
+                    }
                 }
                 return noErr
             },
@@ -115,13 +121,19 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             &hotKeyHandler
         )
         guard handlerStatus == noErr else {
-            showHotKeyError(status: handlerStatus)
+            showHotKeyError(shortcut: "keyboard shortcuts", status: handlerStatus)
             return
         }
 
-        let hotKeyID = EventHotKeyID(signature: 0x42656172, id: 1)
+        registerHotKey(keyCode: UInt32(kVK_ANSI_B), id: 1, shortcut: "Control-Option-B")
+        registerHotKey(keyCode: UInt32(kVK_ANSI_N), id: 2, shortcut: "Control-Option-N")
+    }
+
+    private func registerHotKey(keyCode: UInt32, id: UInt32, shortcut: String) {
+        let hotKeyID = EventHotKeyID(signature: 0x42656172, id: id)
+        var hotKey: EventHotKeyRef?
         let registrationStatus = RegisterEventHotKey(
-            UInt32(kVK_ANSI_B),
+            keyCode,
             UInt32(controlKey | optionKey),
             hotKeyID,
             GetApplicationEventTarget(),
@@ -129,13 +141,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             &hotKey
         )
         if registrationStatus != noErr {
-            showHotKeyError(status: registrationStatus)
+            showHotKeyError(shortcut: shortcut, status: registrationStatus)
+        } else if let hotKey {
+            hotKeys.append(hotKey)
         }
     }
 
-    private func showHotKeyError(status: OSStatus) {
+    private func showHotKeyError(shortcut: String, status: OSStatus) {
         let alert = NSAlert()
-        alert.messageText = "Could not register Control-Option-B"
+        alert.messageText = "Could not register \(shortcut)"
         alert.informativeText = "Another app may already be using this shortcut. Error \(status)."
         alert.alertStyle = .warning
         alert.runModal()
@@ -154,6 +168,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     fileprivate func showNextCamera() {
         showCamera(at: (currentCameraIndex + 1) % cameras.count)
+    }
+
+    fileprivate func showCurrentCamera() {
+        if popover.isShown {
+            popover.performClose(nil)
+            return
+        }
+        showCamera(at: max(currentCameraIndex, 0))
     }
 
     private func showCamera(at index: Int) {
@@ -192,13 +214,28 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         webView.loadHTMLString("", baseURL: nil)
     }
 
+    private var popoverSize: NSSize {
+        if UserDefaults.standard.bool(forKey: largeViewDefaultsKey) {
+            return NSSize(width: 960, height: 540)
+        }
+        return NSSize(width: 640, height: 360)
+    }
+
     private func makeMenu() -> NSMenu {
         let menu = NSMenu()
         menu.delegate = self
 
+        let showItem = NSMenuItem(
+            title: popover.isShown ? "Hide Bears" : "Show Bears",
+            action: #selector(showCurrentCameraFromMenu),
+            keyEquivalent: "b"
+        )
+        showItem.target = self
+        showItem.keyEquivalentModifierMask = [.control, .option]
+        menu.addItem(showItem)
+
         let nextItem = NSMenuItem(title: "Next Camera", action: #selector(nextCameraFromMenu), keyEquivalent: "n")
         nextItem.target = self
-        nextItem.keyEquivalent = "b"
         nextItem.keyEquivalentModifierMask = [.control, .option]
         menu.addItem(nextItem)
         menu.addItem(.separator())
@@ -217,6 +254,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         exploreItem.isEnabled = currentCameraIndex >= 0
         menu.addItem(exploreItem)
 
+        let largeViewItem = NSMenuItem(title: "Large View", action: #selector(toggleLargeView), keyEquivalent: "")
+        largeViewItem.target = self
+        largeViewItem.state = UserDefaults.standard.bool(forKey: largeViewDefaultsKey) ? .on : .off
+        menu.addItem(largeViewItem)
+
         let loginItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
         loginItem.target = self
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
@@ -233,6 +275,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         showNextCamera()
     }
 
+    @objc private func showCurrentCameraFromMenu() {
+        showCurrentCamera()
+    }
+
     @objc private func selectCamera(_ sender: NSMenuItem) {
         showCamera(at: sender.tag)
     }
@@ -240,6 +286,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     @objc private func openExplore() {
         guard currentCameraIndex >= 0 else { return }
         NSWorkspace.shared.open(cameras[currentCameraIndex].pageURL)
+    }
+
+    @objc private func toggleLargeView() {
+        let defaults = UserDefaults.standard
+        defaults.set(!defaults.bool(forKey: largeViewDefaultsKey), forKey: largeViewDefaultsKey)
+        popover.contentSize = popoverSize
     }
 
     private func requestLaunchAtLoginOnce() {
