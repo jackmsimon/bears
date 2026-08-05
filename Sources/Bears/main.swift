@@ -12,6 +12,7 @@ private struct Camera {
 @MainActor
 private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopoverDelegate {
     private let largeViewDefaultsKey = "LargeView"
+    private let minimizeOnUnfocusDefaultsKey = "MinimizeOnUnfocus"
     private let cameras = [
         Camera(
             name: "Brooks Falls",
@@ -38,6 +39,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var hotKeyHandler: EventHandlerRef?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        UserDefaults.standard.register(defaults: [minimizeOnUnfocusDefaultsKey: true])
         createStatusItem()
         createPopover()
         registerHotKey()
@@ -78,7 +80,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         popover = NSPopover()
         popover.contentSize = popoverSize
         popover.contentViewController = viewController
-        popover.behavior = .transient
+        popover.behavior = popoverBehavior
         popover.delegate = self
     }
 
@@ -221,6 +223,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         return NSSize(width: 640, height: 360)
     }
 
+    private var popoverBehavior: NSPopover.Behavior {
+        UserDefaults.standard.bool(forKey: minimizeOnUnfocusDefaultsKey) ? .transient : .applicationDefined
+    }
+
     private func makeMenu() -> NSMenu {
         let menu = NSMenu()
         menu.delegate = self
@@ -259,6 +265,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         largeViewItem.state = UserDefaults.standard.bool(forKey: largeViewDefaultsKey) ? .on : .off
         menu.addItem(largeViewItem)
 
+        let minimizeItem = NSMenuItem(
+            title: "Minimize on un-focus",
+            action: #selector(toggleMinimizeOnUnfocus),
+            keyEquivalent: ""
+        )
+        minimizeItem.target = self
+        minimizeItem.state = UserDefaults.standard.bool(forKey: minimizeOnUnfocusDefaultsKey) ? .on : .off
+        menu.addItem(minimizeItem)
+
         let loginItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
         loginItem.target = self
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
@@ -292,6 +307,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         let defaults = UserDefaults.standard
         defaults.set(!defaults.bool(forKey: largeViewDefaultsKey), forKey: largeViewDefaultsKey)
         popover.contentSize = popoverSize
+    }
+
+    @objc private func toggleMinimizeOnUnfocus() {
+        let defaults = UserDefaults.standard
+        defaults.set(!defaults.bool(forKey: minimizeOnUnfocusDefaultsKey), forKey: minimizeOnUnfocusDefaultsKey)
+        popover.behavior = popoverBehavior
     }
 
     private func requestLaunchAtLoginOnce() {
