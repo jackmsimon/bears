@@ -9,35 +9,49 @@ private struct Camera {
     let pageURL: URL
 }
 
-/// Wraps the popover content in a grab band that resizes the popover when its
-/// edges are dragged. A popover has no window chrome of its own, so the drag
-/// handling lives here. The top edge is pinned to the status item and is
-/// deliberately not draggable.
+/// A borderless floating panel that can take key without activating the app,
+/// so clicking the camera never pulls focus away from what you are working on.
+private final class CameraPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+}
+
+/// Draws the panel's border band and turns drags on it into window moves and
+/// resizes. The panel is borderless so it keeps the chrome-free look of the
+/// popover it replaced, which means the window server gives it no title bar or
+/// resize control of its own.
+///
+/// - top band: moves the panel, standing in for a title bar
+/// - left, right and bottom bands: resize the panel
+/// - Command-drag: moves the panel from anywhere, including over the video
 @MainActor
-private final class ResizableContentView: NSView {
-    struct Edges: OptionSet {
+private final class PanelChromeView: NSView {
+    struct Handles: OptionSet {
         let rawValue: Int
 
-        static let left = Edges(rawValue: 1 << 0)
-        static let right = Edges(rawValue: 1 << 1)
-        static let bottom = Edges(rawValue: 1 << 2)
+        static let left = Handles(rawValue: 1 << 0)
+        static let right = Handles(rawValue: 1 << 1)
+        static let bottom = Handles(rawValue: 1 << 2)
+        static let move = Handles(rawValue: 1 << 3)
     }
 
-    var onResizeStarted: (() -> Void)?
-    var onResize: ((NSSize) -> Void)?
-    var onResizeFinished: ((NSSize) -> Void)?
+    var minimumSize = NSSize(width: 320, height: 180)
+    var onFrameChanged: ((NSRect) -> Void)?
 
-    private let grabMargin: CGFloat = 8
+    private let grabMargin: CGFloat = 10
     private let content: NSView
-    private var dragEdges: Edges = []
+    private var dragHandles: Handles = []
     private var dragStartLocation: NSPoint = .zero
-    private var dragStartSize: NSSize = .zero
-    private var showingResizeCursor = false
+    private var dragStartFrame: NSRect = .zero
+    private var showingCustomCursor = false
 
     init(content: NSView, size: NSSize) {
         self.content = content
         super.init(frame: NSRect(origin: .zero, size: size))
         addSubview(content)
+        wantsLayer = true
+        layer?.cornerRadius = 10
+        layer?.masksToBounds = true
         layoutContent()
     }
 
@@ -60,19 +74,34 @@ private final class ResizableContentView: NSView {
         content.frame = bounds.insetBy(dx: grabMargin, dy: grabMargin)
     }
 
-    private func edges(at point: NSPoint) -> Edges {
-        guard bounds.contains(point) else { return [] }
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.windowBackgroundColor.setFill()
+        bounds.fill()
 
-        var edges: Edges = []
-        if point.x <= bounds.minX + grabMargin { edges.insert(.left) }
-        if point.x >= bounds.maxX - grabMargin { edges.insert(.right) }
-        if point.y <= bounds.minY + grabMargin { edges.insert(.bottom) }
-        return edges
+        // A grip on the top band so the drag handle is visible.
+        let grip = NSRect(x: bounds.midX - 16, y: bounds.maxY - grabMargin / 2 - 1.5, width: 32, height: 3)
+        NSColor.secondaryLabelColor.withAlphaComponent(0.5).setFill()
+        NSBezierPath(roundedRect: grip, xRadius: 1.5, yRadius: 1.5).fill()
     }
 
-    private func cursor(for edges: Edges) -> NSCursor? {
-        let horizontal = edges.contains(.left) || edges.contains(.right)
-        switch (horizontal, edges.contains(.bottom)) {
+    private func handles(at point: NSPoint) -> Handles {
+        guard bounds.contains(point) else { return [] }
+
+        var handles: Handles = []
+        if point.x <= bounds.minX + grabMargin { handles.insert(.left) }
+        if point.x >= bounds.maxX - grabMargin { handles.insert(.right) }
+        if point.y <= bounds.minY + grabMargin { handles.insert(.bottom) }
+        // The top band is the drag handle, so it never resizes. Corners stay
+        // with the side they touch.
+        if handles.isEmpty, point.y >= bounds.maxY - grabMargin { return .move }
+        return handles
+    }
+
+    private func cursor(for handles: Handles, dragging: Bool) -> NSCursor? {
+        if handles.contains(.move) { return dragging ? .closedHand : .openHand }
+
+        let horizontal = handles.contains(.left) || handles.contains(.right)
+        switch (horizontal, handles.contains(.bottom)) {
         case (true, true): return .crosshair
         case (true, false): return .resizeLeftRight
         case (false, true): return .resizeUpDown
@@ -80,10 +109,13 @@ private final class ResizableContentView: NSView {
         }
     }
 
-    /// Only claim clicks that land in the grab band so the web view keeps the rest.
+    /// Only claim clicks on the band, so the web view keeps everything else.
+    /// Command is the exception: it makes the whole panel a drag handle.
     override func hitTest(_ point: NSPoint) -> NSView? {
         let local = superview.map { convert(point, from: $0) } ?? point
-        return edges(at: local).isEmpty ? super.hitTest(point) : self
+        guard bounds.contains(local) else { return super.hitTest(point) }
+        if NSEvent.modifierFlags.contains(.command) { return self }
+        return handles(at: local).isEmpty ? super.hitTest(point) : self
     }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
@@ -104,82 +136,98 @@ private final class ResizableContentView: NSView {
     }
 
     override func mouseMoved(with event: NSEvent) {
-        guard dragEdges.isEmpty else { return }
+        guard dragHandles.isEmpty else { return }
 
-        if let cursor = cursor(for: edges(at: convert(event.locationInWindow, from: nil))) {
+        let at = handles(at: convert(event.locationInWindow, from: nil))
+        if let cursor = cursor(for: at, dragging: false) {
             cursor.set()
-            showingResizeCursor = true
-        } else if showingResizeCursor {
+            showingCustomCursor = true
+        } else if showingCustomCursor {
             NSCursor.arrow.set()
-            showingResizeCursor = false
+            showingCustomCursor = false
         }
     }
 
     override func mouseExited(with event: NSEvent) {
-        guard dragEdges.isEmpty, showingResizeCursor else { return }
+        guard dragHandles.isEmpty, showingCustomCursor else { return }
         NSCursor.arrow.set()
-        showingResizeCursor = false
+        showingCustomCursor = false
     }
 
     override func mouseDown(with event: NSEvent) {
-        dragEdges = edges(at: convert(event.locationInWindow, from: nil))
-        guard !dragEdges.isEmpty else {
+        let local = convert(event.locationInWindow, from: nil)
+        dragHandles = NSEvent.modifierFlags.contains(.command) ? .move : handles(at: local)
+        guard !dragHandles.isEmpty, let window else {
             super.mouseDown(with: event)
             return
         }
 
         dragStartLocation = NSEvent.mouseLocation
-        dragStartSize = bounds.size
-        onResizeStarted?()
+        dragStartFrame = window.frame
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard !dragEdges.isEmpty else {
+        guard !dragHandles.isEmpty, let window else {
             super.mouseDragged(with: event)
             return
         }
 
-        cursor(for: dragEdges)?.set()
-        onResize?(proposedSize(forPointerAt: NSEvent.mouseLocation))
+        cursor(for: dragHandles, dragging: true)?.set()
+        window.setFrame(proposedFrame(forPointerAt: NSEvent.mouseLocation), display: true)
     }
 
     override func mouseUp(with event: NSEvent) {
-        guard !dragEdges.isEmpty else {
+        guard !dragHandles.isEmpty, let window else {
             super.mouseUp(with: event)
             return
         }
 
-        let size = proposedSize(forPointerAt: NSEvent.mouseLocation)
-        dragEdges = []
-        showingResizeCursor = false
+        let frame = proposedFrame(forPointerAt: NSEvent.mouseLocation)
+        window.setFrame(frame, display: true)
+        dragHandles = []
+        showingCustomCursor = false
         NSCursor.arrow.set()
-        onResizeFinished?(size)
+        onFrameChanged?(frame)
     }
 
-    private func proposedSize(forPointerAt location: NSPoint) -> NSSize {
+    private func proposedFrame(forPointerAt location: NSPoint) -> NSRect {
         let deltaX = location.x - dragStartLocation.x
         let deltaY = location.y - dragStartLocation.y
-        var size = dragStartSize
+        var frame = dragStartFrame
 
-        // The popover stays centred on the status item, so a side edge only
-        // travels half of any width change. Double the delta to keep the
-        // dragged edge under the pointer.
-        if dragEdges.contains(.right) { size.width += 2 * deltaX }
-        if dragEdges.contains(.left) { size.width -= 2 * deltaX }
-        // The top edge is pinned, so the popover grows downwards as the screen
-        // coordinate falls.
-        if dragEdges.contains(.bottom) { size.height -= deltaY }
-        return size
+        if dragHandles.contains(.move) {
+            frame.origin.x += deltaX
+            frame.origin.y += deltaY
+            return frame
+        }
+
+        // Each edge keeps the opposite edge pinned, so the panel grows in the
+        // direction of the drag rather than around its centre.
+        if dragHandles.contains(.right) {
+            frame.size.width = max(dragStartFrame.width + deltaX, minimumSize.width)
+        }
+        if dragHandles.contains(.left) {
+            frame.size.width = max(dragStartFrame.width - deltaX, minimumSize.width)
+            frame.origin.x = dragStartFrame.maxX - frame.size.width
+        }
+        if dragHandles.contains(.bottom) {
+            frame.size.height = max(dragStartFrame.height - deltaY, minimumSize.height)
+            frame.origin.y = dragStartFrame.maxY - frame.size.height
+        }
+        return frame
     }
 }
 
 @MainActor
-private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopoverDelegate {
+private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate {
     private let largeViewDefaultsKey = "LargeView"
     private let minimizeOnUnfocusDefaultsKey = "MinimizeOnUnfocus"
     private let customWidthDefaultsKey = "CustomWidth"
     private let customHeightDefaultsKey = "CustomHeight"
-    private let minimumPopoverSize = NSSize(width: 320, height: 180)
+    private let originXDefaultsKey = "PanelOriginX"
+    private let originYDefaultsKey = "PanelOriginY"
+    private let hasStoredOriginDefaultsKey = "HasPanelOrigin"
+    private let minimumPanelSize = NSSize(width: 320, height: 180)
     private let cameras = [
         Camera(
             name: "Brooks Falls",
@@ -200,7 +248,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     private var currentCameraIndex = -1
     private var statusItem: NSStatusItem!
-    private var popover: NSPopover!
+    private var panel: CameraPanel!
+    private var chrome: PanelChromeView!
     private var webView: WKWebView!
     private var hotKeys: [EventHotKeyRef] = []
     private var hotKeyHandler: EventHandlerRef?
@@ -208,12 +257,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     func applicationDidFinishLaunching(_ notification: Notification) {
         UserDefaults.standard.register(defaults: [minimizeOnUnfocusDefaultsKey: true])
         createStatusItem()
-        createPopover()
+        createPanel()
         registerHotKey()
         requestLaunchAtLoginOnce()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        if panel.isVisible {
+            storePanelFrame(panel.frame)
+        }
         for hotKey in hotKeys {
             UnregisterEventHotKey(hotKey)
         }
@@ -234,38 +286,37 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         button.sendAction(on: [.leftMouseUp, .rightMouseUp])
     }
 
-    private func createPopover() {
+    private func createPanel() {
         let configuration = WKWebViewConfiguration()
         configuration.allowsAirPlayForMediaPlayback = true
         configuration.mediaTypesRequiringUserActionForPlayback = []
 
         webView = WKWebView(frame: .zero, configuration: configuration)
 
-        let size = popoverSize
-        let contentView = ResizableContentView(content: webView, size: size)
-        contentView.onResizeStarted = { [weak self] in
-            self?.popover.animates = false
-        }
-        contentView.onResize = { [weak self] size in
-            guard let self else { return }
-            self.popover.contentSize = self.clamped(size)
-        }
-        contentView.onResizeFinished = { [weak self] size in
-            guard let self else { return }
-            let size = self.clamped(size)
-            self.popover.contentSize = size
-            self.popover.animates = true
-            self.storeCustomSize(size)
+        let size = clamped(panelSize)
+        chrome = PanelChromeView(content: webView, size: size)
+        chrome.minimumSize = minimumPanelSize
+        chrome.onFrameChanged = { [weak self] frame in
+            self?.storePanelFrame(frame)
         }
 
-        let viewController = NSViewController()
-        viewController.view = contentView
-
-        popover = NSPopover()
-        popover.contentSize = size
-        popover.contentViewController = viewController
-        popover.behavior = popoverBehavior
-        popover.delegate = self
+        panel = CameraPanel(
+            contentRect: NSRect(origin: .zero, size: size),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.contentView = chrome
+        panel.delegate = self
+        panel.isFloatingPanel = true
+        panel.level = .floating
+        panel.hidesOnDeactivate = false
+        panel.isMovableByWindowBackground = false
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.isReleasedWhenClosed = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
     }
 
     private func registerHotKey() {
@@ -357,8 +408,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     fileprivate func showCurrentCamera() {
-        if popover.isShown {
-            popover.performClose(nil)
+        if panel.isVisible {
+            hidePanel()
             return
         }
         showCamera(at: max(currentCameraIndex, 0))
@@ -366,12 +417,23 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     private func showCamera(at index: Int) {
         currentCameraIndex = index
-        let camera = cameras[index]
-        load(camera)
-        guard let button = statusItem.button else { return }
-        if !popover.isShown {
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-        }
+        load(cameras[index])
+        guard !panel.isVisible else { return }
+
+        panel.setFrame(startingFrame(), display: false)
+        panel.makeKeyAndOrderFront(nil)
+    }
+
+    private func hidePanel() {
+        guard panel.isVisible else { return }
+        storePanelFrame(panel.frame)
+        panel.orderOut(nil)
+        webView.loadHTMLString("", baseURL: nil)
+    }
+
+    func windowDidResignKey(_ notification: Notification) {
+        guard UserDefaults.standard.bool(forKey: minimizeOnUnfocusDefaultsKey) else { return }
+        hidePanel()
     }
 
     private func load(_ camera: Camera) {
@@ -396,18 +458,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         webView.loadHTMLString(html, baseURL: camera.pageURL)
     }
 
-    func popoverDidClose(_ notification: Notification) {
-        webView.loadHTMLString("", baseURL: nil)
-    }
-
     /// A size the user dragged out wins until Large View is toggled again.
-    private var popoverSize: NSSize {
+    private var panelSize: NSSize {
         let defaults = UserDefaults.standard
         let custom = NSSize(
             width: defaults.double(forKey: customWidthDefaultsKey),
             height: defaults.double(forKey: customHeightDefaultsKey)
         )
-        if custom.width >= minimumPopoverSize.width, custom.height >= minimumPopoverSize.height {
+        if custom.width >= minimumPanelSize.width, custom.height >= minimumPanelSize.height {
             return clamped(custom)
         }
         if defaults.bool(forKey: largeViewDefaultsKey) {
@@ -420,24 +478,61 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         var maximum = NSSize(width: 1920, height: 1080)
         if let screen = statusItem?.button?.window?.screen ?? NSScreen.main {
             maximum = NSSize(
-                width: max(screen.visibleFrame.width - 40, minimumPopoverSize.width),
-                height: max(screen.visibleFrame.height - 40, minimumPopoverSize.height)
+                width: max(screen.visibleFrame.width, minimumPanelSize.width),
+                height: max(screen.visibleFrame.height, minimumPanelSize.height)
             )
         }
         return NSSize(
-            width: min(max(size.width, minimumPopoverSize.width), maximum.width),
-            height: min(max(size.height, minimumPopoverSize.height), maximum.height)
+            width: min(max(size.width, minimumPanelSize.width), maximum.width),
+            height: min(max(size.height, minimumPanelSize.height), maximum.height)
         )
     }
 
-    private func storeCustomSize(_ size: NSSize) {
-        let defaults = UserDefaults.standard
-        defaults.set(Double(size.width), forKey: customWidthDefaultsKey)
-        defaults.set(Double(size.height), forKey: customHeightDefaultsKey)
+    private func startingFrame() -> NSRect {
+        let size = clamped(panelSize)
+        guard let origin = storedOrigin() else {
+            return NSRect(origin: defaultOrigin(for: size), size: size)
+        }
+        return rescuedIfOffscreen(NSRect(origin: origin, size: size))
     }
 
-    private var popoverBehavior: NSPopover.Behavior {
-        UserDefaults.standard.bool(forKey: minimizeOnUnfocusDefaultsKey) ? .transient : .applicationDefined
+    /// Under the paw, the way the popover used to sit.
+    private func defaultOrigin(for size: NSSize) -> NSPoint {
+        guard let button = statusItem?.button, let buttonWindow = button.window else {
+            let visible = (NSScreen.main ?? NSScreen.screens[0]).visibleFrame
+            return NSPoint(x: visible.midX - size.width / 2, y: visible.midY - size.height / 2)
+        }
+        let rect = buttonWindow.convertToScreen(button.convert(button.bounds, to: nil))
+        return NSPoint(x: rect.midX - size.width / 2, y: rect.minY - size.height - 6)
+    }
+
+    /// A stored position can outlive the display it was on. Only step in when
+    /// the panel would come back mostly out of reach.
+    private func rescuedIfOffscreen(_ frame: NSRect) -> NSRect {
+        let reachable = NSScreen.screens.contains { screen in
+            let overlap = screen.visibleFrame.intersection(frame)
+            guard !overlap.isNull else { return false }
+            return overlap.width * overlap.height >= 0.4 * frame.width * frame.height
+        }
+        return reachable ? frame : NSRect(origin: defaultOrigin(for: frame.size), size: frame.size)
+    }
+
+    private func storedOrigin() -> NSPoint? {
+        let defaults = UserDefaults.standard
+        guard defaults.bool(forKey: hasStoredOriginDefaultsKey) else { return nil }
+        return NSPoint(
+            x: defaults.double(forKey: originXDefaultsKey),
+            y: defaults.double(forKey: originYDefaultsKey)
+        )
+    }
+
+    private func storePanelFrame(_ frame: NSRect) {
+        let defaults = UserDefaults.standard
+        defaults.set(Double(frame.origin.x), forKey: originXDefaultsKey)
+        defaults.set(Double(frame.origin.y), forKey: originYDefaultsKey)
+        defaults.set(true, forKey: hasStoredOriginDefaultsKey)
+        defaults.set(Double(frame.width), forKey: customWidthDefaultsKey)
+        defaults.set(Double(frame.height), forKey: customHeightDefaultsKey)
     }
 
     private func makeMenu() -> NSMenu {
@@ -445,7 +540,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         menu.delegate = self
 
         let showItem = NSMenuItem(
-            title: popover.isShown ? "Hide Bears" : "Show Bears",
+            title: panel.isVisible ? "Hide Bears" : "Show Bears",
             action: #selector(showCurrentCameraFromMenu),
             keyEquivalent: "b"
         )
@@ -477,6 +572,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         largeViewItem.target = self
         largeViewItem.state = UserDefaults.standard.bool(forKey: largeViewDefaultsKey) ? .on : .off
         menu.addItem(largeViewItem)
+
+        let resetItem = NSMenuItem(title: "Reset Position", action: #selector(resetPosition), keyEquivalent: "")
+        resetItem.target = self
+        menu.addItem(resetItem)
 
         let minimizeItem = NSMenuItem(
             title: "Minimize on un-focus",
@@ -522,13 +621,36 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         // The presets are the way back to a known size after dragging.
         defaults.removeObject(forKey: customWidthDefaultsKey)
         defaults.removeObject(forKey: customHeightDefaultsKey)
-        popover.contentSize = popoverSize
+        resizePanelKeepingTopLeft(to: clamped(panelSize))
+    }
+
+    /// Grow from the top-left, so the corner the user parked stays put.
+    private func resizePanelKeepingTopLeft(to size: NSSize) {
+        let current = panel.frame
+        let frame = NSRect(
+            origin: NSPoint(x: current.minX, y: current.maxY - size.height),
+            size: size
+        )
+        panel.setFrame(rescuedIfOffscreen(frame), display: true)
+        if panel.isVisible {
+            storePanelFrame(panel.frame)
+        }
+    }
+
+    @objc private func resetPosition() {
+        let defaults = UserDefaults.standard
+        defaults.removeObject(forKey: hasStoredOriginDefaultsKey)
+        defaults.removeObject(forKey: originXDefaultsKey)
+        defaults.removeObject(forKey: originYDefaultsKey)
+        guard panel.isVisible else { return }
+
+        let size = clamped(panelSize)
+        panel.setFrame(NSRect(origin: defaultOrigin(for: size), size: size), display: true)
     }
 
     @objc private func toggleMinimizeOnUnfocus() {
         let defaults = UserDefaults.standard
         defaults.set(!defaults.bool(forKey: minimizeOnUnfocusDefaultsKey), forKey: minimizeOnUnfocusDefaultsKey)
-        popover.behavior = popoverBehavior
     }
 
     private func requestLaunchAtLoginOnce() {
