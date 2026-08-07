@@ -9,10 +9,177 @@ private struct Camera {
     let pageURL: URL
 }
 
+/// Wraps the popover content in a grab band that resizes the popover when its
+/// edges are dragged. A popover has no window chrome of its own, so the drag
+/// handling lives here. The top edge is pinned to the status item and is
+/// deliberately not draggable.
+@MainActor
+private final class ResizableContentView: NSView {
+    struct Edges: OptionSet {
+        let rawValue: Int
+
+        static let left = Edges(rawValue: 1 << 0)
+        static let right = Edges(rawValue: 1 << 1)
+        static let bottom = Edges(rawValue: 1 << 2)
+    }
+
+    var onResizeStarted: (() -> Void)?
+    var onResize: ((NSSize) -> Void)?
+    var onResizeFinished: ((NSSize) -> Void)?
+
+    private let grabMargin: CGFloat = 8
+    private let content: NSView
+    private var dragEdges: Edges = []
+    private var dragStartLocation: NSPoint = .zero
+    private var dragStartSize: NSSize = .zero
+    private var showingResizeCursor = false
+
+    init(content: NSView, size: NSSize) {
+        self.content = content
+        super.init(frame: NSRect(origin: .zero, size: size))
+        addSubview(content)
+        layoutContent()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        layoutContent()
+    }
+
+    override func layout() {
+        super.layout()
+        layoutContent()
+    }
+
+    private func layoutContent() {
+        content.frame = bounds.insetBy(dx: grabMargin, dy: grabMargin)
+    }
+
+    private func edges(at point: NSPoint) -> Edges {
+        guard bounds.contains(point) else { return [] }
+
+        var edges: Edges = []
+        if point.x <= bounds.minX + grabMargin { edges.insert(.left) }
+        if point.x >= bounds.maxX - grabMargin { edges.insert(.right) }
+        if point.y <= bounds.minY + grabMargin { edges.insert(.bottom) }
+        return edges
+    }
+
+    private func cursor(for edges: Edges) -> NSCursor? {
+        let horizontal = edges.contains(.left) || edges.contains(.right)
+        switch (horizontal, edges.contains(.bottom)) {
+        case (true, true): return .crosshair
+        case (true, false): return .resizeLeftRight
+        case (false, true): return .resizeUpDown
+        case (false, false): return nil
+        }
+    }
+
+    /// Only claim clicks that land in the grab band so the web view keeps the rest.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let local = superview.map { convert(point, from: $0) } ?? point
+        return edges(at: local).isEmpty ? super.hitTest(point) : self
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas {
+            removeTrackingArea(area)
+        }
+        addTrackingArea(NSTrackingArea(
+            rect: bounds,
+            options: [.activeAlways, .inVisibleRect, .mouseMoved, .mouseEnteredAndExited],
+            owner: self,
+            userInfo: nil
+        ))
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        guard dragEdges.isEmpty else { return }
+
+        if let cursor = cursor(for: edges(at: convert(event.locationInWindow, from: nil))) {
+            cursor.set()
+            showingResizeCursor = true
+        } else if showingResizeCursor {
+            NSCursor.arrow.set()
+            showingResizeCursor = false
+        }
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        guard dragEdges.isEmpty, showingResizeCursor else { return }
+        NSCursor.arrow.set()
+        showingResizeCursor = false
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        dragEdges = edges(at: convert(event.locationInWindow, from: nil))
+        guard !dragEdges.isEmpty else {
+            super.mouseDown(with: event)
+            return
+        }
+
+        dragStartLocation = NSEvent.mouseLocation
+        dragStartSize = bounds.size
+        onResizeStarted?()
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard !dragEdges.isEmpty else {
+            super.mouseDragged(with: event)
+            return
+        }
+
+        cursor(for: dragEdges)?.set()
+        onResize?(proposedSize(forPointerAt: NSEvent.mouseLocation))
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard !dragEdges.isEmpty else {
+            super.mouseUp(with: event)
+            return
+        }
+
+        let size = proposedSize(forPointerAt: NSEvent.mouseLocation)
+        dragEdges = []
+        showingResizeCursor = false
+        NSCursor.arrow.set()
+        onResizeFinished?(size)
+    }
+
+    private func proposedSize(forPointerAt location: NSPoint) -> NSSize {
+        let deltaX = location.x - dragStartLocation.x
+        let deltaY = location.y - dragStartLocation.y
+        var size = dragStartSize
+
+        // The popover stays centred on the status item, so a side edge only
+        // travels half of any width change. Double the delta to keep the
+        // dragged edge under the pointer.
+        if dragEdges.contains(.right) { size.width += 2 * deltaX }
+        if dragEdges.contains(.left) { size.width -= 2 * deltaX }
+        // The top edge is pinned, so the popover grows downwards as the screen
+        // coordinate falls.
+        if dragEdges.contains(.bottom) { size.height -= deltaY }
+        return size
+    }
+}
+
 @MainActor
 private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopoverDelegate {
     private let largeViewDefaultsKey = "LargeView"
     private let minimizeOnUnfocusDefaultsKey = "MinimizeOnUnfocus"
+    private let customWidthDefaultsKey = "CustomWidth"
+    private let customHeightDefaultsKey = "CustomHeight"
+    private let minimumPopoverSize = NSSize(width: 320, height: 180)
     private let cameras = [
         Camera(
             name: "Brooks Falls",
@@ -74,11 +241,28 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         webView = WKWebView(frame: .zero, configuration: configuration)
 
+        let size = popoverSize
+        let contentView = ResizableContentView(content: webView, size: size)
+        contentView.onResizeStarted = { [weak self] in
+            self?.popover.animates = false
+        }
+        contentView.onResize = { [weak self] size in
+            guard let self else { return }
+            self.popover.contentSize = self.clamped(size)
+        }
+        contentView.onResizeFinished = { [weak self] size in
+            guard let self else { return }
+            let size = self.clamped(size)
+            self.popover.contentSize = size
+            self.popover.animates = true
+            self.storeCustomSize(size)
+        }
+
         let viewController = NSViewController()
-        viewController.view = webView
+        viewController.view = contentView
 
         popover = NSPopover()
-        popover.contentSize = popoverSize
+        popover.contentSize = size
         popover.contentViewController = viewController
         popover.behavior = popoverBehavior
         popover.delegate = self
@@ -216,11 +400,40 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         webView.loadHTMLString("", baseURL: nil)
     }
 
+    /// A size the user dragged out wins until Large View is toggled again.
     private var popoverSize: NSSize {
-        if UserDefaults.standard.bool(forKey: largeViewDefaultsKey) {
+        let defaults = UserDefaults.standard
+        let custom = NSSize(
+            width: defaults.double(forKey: customWidthDefaultsKey),
+            height: defaults.double(forKey: customHeightDefaultsKey)
+        )
+        if custom.width >= minimumPopoverSize.width, custom.height >= minimumPopoverSize.height {
+            return clamped(custom)
+        }
+        if defaults.bool(forKey: largeViewDefaultsKey) {
             return NSSize(width: 960, height: 540)
         }
         return NSSize(width: 640, height: 360)
+    }
+
+    private func clamped(_ size: NSSize) -> NSSize {
+        var maximum = NSSize(width: 1920, height: 1080)
+        if let screen = statusItem?.button?.window?.screen ?? NSScreen.main {
+            maximum = NSSize(
+                width: max(screen.visibleFrame.width - 40, minimumPopoverSize.width),
+                height: max(screen.visibleFrame.height - 40, minimumPopoverSize.height)
+            )
+        }
+        return NSSize(
+            width: min(max(size.width, minimumPopoverSize.width), maximum.width),
+            height: min(max(size.height, minimumPopoverSize.height), maximum.height)
+        )
+    }
+
+    private func storeCustomSize(_ size: NSSize) {
+        let defaults = UserDefaults.standard
+        defaults.set(Double(size.width), forKey: customWidthDefaultsKey)
+        defaults.set(Double(size.height), forKey: customHeightDefaultsKey)
     }
 
     private var popoverBehavior: NSPopover.Behavior {
@@ -306,6 +519,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     @objc private func toggleLargeView() {
         let defaults = UserDefaults.standard
         defaults.set(!defaults.bool(forKey: largeViewDefaultsKey), forKey: largeViewDefaultsKey)
+        // The presets are the way back to a known size after dragging.
+        defaults.removeObject(forKey: customWidthDefaultsKey)
+        defaults.removeObject(forKey: customHeightDefaultsKey)
         popover.contentSize = popoverSize
     }
 
